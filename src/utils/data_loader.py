@@ -1,26 +1,26 @@
 import os
 import json
 from PIL import Image
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 from config import TRAIN_ANNOTATIONS, TRAIN_DIR, VALID_ANNOTATIONS, VALID_DIR
-from torchvision.transforms.functional import to_tensor, to_pil_image
-import matplotlib.pyplot as plt
+from mask_utils import polygons_to_mask  # for converting polygons to mask
 
-# Custom dataset class to load images and their annotation info from COCO format
+# Custom dataset class to load image and full mask
 class PetRadiologyDataset(Dataset):
     def __init__(self, image_dir, annotation_file, transform=None):
-        self.image_dir = image_dir                  # Path to image folder
-        self.transform = transform                  # Optional image transformations
+        self.image_dir = image_dir
+        self.transform = transform
 
-        # Load annotation JSON file (COCO format)
+        # Load COCO JSON
         with open(annotation_file, "r") as f:
             coco_data = json.load(f)
 
-        self.images = coco_data["images"]           # List of image metadata
-        self.annotations = coco_data["annotations"] # List of annotation objects
+        self.images = coco_data["images"]
+        self.annotations = coco_data["annotations"]
 
-        # Organize annotations by image_id for fast lookup
+        # Group annotations by image_id
         self.ann_by_image = {}
         for ann in self.annotations:
             img_id = ann["image_id"]
@@ -29,68 +29,66 @@ class PetRadiologyDataset(Dataset):
             self.ann_by_image[img_id].append(ann)
 
     def __len__(self):
-        return len(self.images)  # Total number of images
+        return len(self.images)
 
     def __getitem__(self, idx):
-        # Get image metadata and ID
         image_info = self.images[idx]
         image_id = image_info["id"]
         filename = image_info["file_name"]
 
-        # Build the image path and load it
+        # Load image
         image_path = os.path.join(self.image_dir, filename)
         image = Image.open(image_path).convert("RGB")
+        width, height = image.size
 
-        # Load all annotations (segmentations) for this image
-        segmentations = self.ann_by_image.get(image_id, [])
+        # Build empty mask
+        full_mask = np.zeros((height, width), dtype=np.uint8)
 
-        # Apply any transformations to the image (resizing, normalization, etc.)
+        # Load and combine masks from all annotations for this image
+        annotations = self.ann_by_image.get(image_id, [])
+        for ann in annotations:
+            segmentation = ann.get("segmentation", [])
+            mask = polygons_to_mask(segmentation, (height, width))
+            full_mask = np.maximum(full_mask, mask)  # combine masks
+
+        # Convert to PIL Image for transforms
+        mask_pil = Image.fromarray(full_mask)
+
+        # Apply transforms (resize both image and mask the same way)
         if self.transform:
             image = self.transform(image)
+            mask = transforms.ToTensor()(mask_pil)  # Convert mask to 1xHxW tensor
 
-        # For now, return image and raw segmentation data (polygons)
-        return image, segmentations
+        return image, mask
 
-# Define basic image transformation: resize + tensor + normalize
+# ✅ Define transform once
 transform = transforms.Compose([
-    transforms.Resize((256, 256)),         # Resize to a fixed size
-    transforms.ToTensor(),                 # Convert image to tensor
-    transforms.Normalize(                  # Normalize pixel values
-        mean=[0.5, 0.5, 0.5],
-        std=[0.5, 0.5, 0.5]
-    )
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
 ])
 
-# Wrapper function to create a DataLoader from a folder + annotation file
 def get_dataloader(image_dir, annotation_file, batch_size=8, shuffle=True):
     dataset = PetRadiologyDataset(image_dir, annotation_file, transform=transform)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
-# test data loading
-
+# Testing
 if __name__ == "__main__":
-    from torchvision.transforms.functional import to_tensor
     import matplotlib.pyplot as plt
+    from torchvision.transforms.functional import to_pil_image
 
-    # Load dataset with NO transform to see the raw image
-    dataset = PetRadiologyDataset(TRAIN_DIR, TRAIN_ANNOTATIONS, transform=None)
+    dataset = PetRadiologyDataset(TRAIN_DIR, TRAIN_ANNOTATIONS, transform=transform)
 
-    # Load first sample (image + segmentation polygons)
-    raw_image, segmentations = dataset[0]
+    image, mask = dataset[0]  # mask will be [1, H, W]
 
-    # Show original image (PIL format)
-    plt.imshow(raw_image)
-    plt.title("Original PIL Image")
+    # Show image
+    plt.imshow(to_pil_image(image))
+    plt.title("Image")
     plt.axis("off")
     plt.show()
 
-    # Convert to tensor without normalization
-    tensor_image = to_tensor(raw_image)  # shape: [C, H, W]
-    plt.imshow(tensor_image.permute(1, 2, 0))  # reshape to [H, W, C] for plotting
-    plt.title("Tensor Image (Unnormalized)")
+    # Show mask
+    plt.imshow(mask.squeeze(0), cmap="gray")
+    plt.title("Segmentation Mask")
     plt.axis("off")
     plt.show()
-
-    # Print the segmentation polygon data
-    print("Segmentation polygons for image 0:")
-    print(segmentations)
