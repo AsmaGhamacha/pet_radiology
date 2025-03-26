@@ -2,28 +2,32 @@ import os
 import json
 from PIL import Image
 import numpy as np
+import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
-from config import TRAIN_ANNOTATIONS, TRAIN_DIR, VALID_ANNOTATIONS, VALID_DIR
-from mask_utils import polygons_to_mask  # for converting polygons to mask
+from src.utils.config import TRAIN_ANNOTATIONS, TRAIN_DIR, VALID_ANNOTATIONS, VALID_DIR
+from src.utils.mask_utils import create_multiclass_mask
 
-# Custom dataset class to load image and full mask
 class PetRadiologyDataset(Dataset):
     def __init__(self, image_dir, annotation_file, transform=None):
         self.image_dir = image_dir
         self.transform = transform
 
-        # Load COCO JSON
         with open(annotation_file, "r") as f:
             coco_data = json.load(f)
 
         self.images = coco_data["images"]
         self.annotations = coco_data["annotations"]
+        self.categories = coco_data["categories"]
+
+        # Build category_id to name mapping
+        self.category_id_to_name = {cat["id"]: cat["name"] for cat in self.categories}
 
         # Group annotations by image_id
         self.ann_by_image = {}
         for ann in self.annotations:
             img_id = ann["image_id"]
+            ann["category_name"] = self.category_id_to_name[ann["category_id"]]  # Inject name
             if img_id not in self.ann_by_image:
                 self.ann_by_image[img_id] = []
             self.ann_by_image[img_id].append(ann)
@@ -36,59 +40,46 @@ class PetRadiologyDataset(Dataset):
         image_id = image_info["id"]
         filename = image_info["file_name"]
 
-        # Load image
         image_path = os.path.join(self.image_dir, filename)
         image = Image.open(image_path).convert("RGB")
         width, height = image.size
 
-        # Build empty mask
-        full_mask = np.zeros((height, width), dtype=np.uint8)
-
-        # Load and combine masks from all annotations for this image
         annotations = self.ann_by_image.get(image_id, [])
-        for ann in annotations:
-            segmentation = ann.get("segmentation", [])
-            mask = polygons_to_mask(segmentation, (height, width))
-            full_mask = np.maximum(full_mask, mask)  # combine masks
+        multiclass_mask = create_multiclass_mask(annotations, (height, width))
+        mask_pil = Image.fromarray(multiclass_mask)
 
-        # Convert to PIL Image for transforms
-        mask_pil = Image.fromarray(full_mask)
-
-        # Apply transforms (resize both image and mask the same way)
         if self.transform:
             image = self.transform(image)
-            mask = transforms.ToTensor()(mask_pil)  # Convert mask to 1xHxW tensor
+            mask = transforms.Resize((256, 256), interpolation=transforms.InterpolationMode.NEAREST)(mask_pil)
+            mask = torch.from_numpy(np.array(mask)).long()  # Convert to tensor with int labels
+        else:
+            mask = torch.from_numpy(multiclass_mask).long()
 
         return image, mask
 
-# ✅ Define transform once
 transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
 def get_dataloader(image_dir, annotation_file, batch_size=8, shuffle=True):
     dataset = PetRadiologyDataset(image_dir, annotation_file, transform=transform)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
-# Testing
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     from torchvision.transforms.functional import to_pil_image
 
     dataset = PetRadiologyDataset(TRAIN_DIR, TRAIN_ANNOTATIONS, transform=transform)
+    image, mask = dataset[0]
 
-    image, mask = dataset[0]  # mask will be [1, H, W]
-
-    # Show image
     plt.imshow(to_pil_image(image))
     plt.title("Image")
     plt.axis("off")
     plt.show()
 
-    # Show mask
-    plt.imshow(mask.squeeze(0), cmap="gray")
-    plt.title("Segmentation Mask")
+    plt.imshow(mask, cmap="tab20")
+    plt.title("Multi-class Mask")
     plt.axis("off")
     plt.show()

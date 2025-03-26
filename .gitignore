@@ -1,1 +1,12 @@
 ai_health/
+
+data/
+
+**/__pycache__/
+*.py[cod]
+
+.env
+
+unet_model.pth
+
+*.pth
